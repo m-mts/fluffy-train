@@ -1,0 +1,106 @@
+# Auto-create back-merge PRs for release branches.
+#
+# Hierarchy: release_X.Y -> release_X -> main
+#   - push to release_2.1  => opens/keeps PR release_2.1 -> release_2
+#   - push to release_2    => opens/keeps PR release_2   -> main
+#
+# Branch name patterns (underscore style):
+#   release_<major>        e.g. release_2
+#   release_<major>.<minor> e.g. release_2.1 (hotfix branch)
+
+name: Auto back-merge PR
+
+on:
+  push:
+    branches:
+      - 'release_*'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  create-backmerge-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine parent branch
+        id: parent
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$BRANCH" =~ ^release_([0-9]+)\.([0-9]+)$ ]]; then
+            PARENT="release_${BASH_REMATCH[1]}"
+          elif [[ "$BRANCH" =~ ^release_([0-9]+)$ ]]; then
+            PARENT="main"
+          else
+            echo "Branch $BRANCH does not match release_X or release_X.Y — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "parent=$PARENT" >> "$GITHUB_OUTPUT"
+
+      - name: Verify parent branch exists
+        if: steps.parent.outputs.skip == 'false'
+        id: parent_exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PARENT: ${{ steps.parent.outputs.parent }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${{ github.repository }}/branches/$PARENT" --silent 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Parent branch $PARENT does not exist; skipping PR creation."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update back-merge PR
+        if: steps.parent.outputs.skip == 'false' && steps.parent_exists.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          PARENT: ${{ steps.parent.outputs.parent }}
+        run: |
+          set -euo pipefail
+
+          # Anything to merge?
+          AHEAD=$(gh api "repos/${{ github.repository }}/compare/$PARENT...$BRANCH" --jq '.ahead_by')
+          if [[ "$AHEAD" == "0" ]]; then
+            echo "$BRANCH has no commits ahead of $PARENT — nothing to back-merge."
+            exit 0
+          fi
+
+          # Existing open PR for this back-merge?
+          EXISTING=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --head "$BRANCH" --base "$PARENT" \
+            --state open --json number --jq 'length')
+          if [[ "$EXISTING" != "0" ]]; then
+            echo "Open back-merge PR $BRANCH -> $PARENT already exists; new commits ride along."
+            exit 0
+          fi
+
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --head "$BRANCH" --base "$PARENT" \
+            --title "Back-merge: $BRANCH -> $PARENT" \
+            --label back-merge \
+            --body "$(cat <<EOF
+          Automated back-merge PR.
+
+          Changes pushed to \`$BRANCH\` must flow back to \`$PARENT\`.
+          Merging into \`$PARENT\` (and up the chain) is blocked by the
+          **backmerge-guard** check until this PR is merged.
+
+          Triggered by commit: ${{ github.sha }}
+          EOF
+          )" || {
+            # --label fails if label doesn't exist; retry without it
+            gh pr create \
+              --repo "${{ github.repository }}" \
+              --head "$BRANCH" --base "$PARENT" \
+              --title "Back-merge: $BRANCH -> $PARENT" \
+              --body "Automated back-merge PR from \`$BRANCH\` to \`$PARENT\`. Triggered by ${{ github.sha }}."
+          }
