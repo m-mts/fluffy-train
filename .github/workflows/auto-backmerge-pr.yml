@@ -1,106 +1,171 @@
-# Auto-create back-merge PRs for release branches.
+# Granular back-merge PRs.
 #
-# Hierarchy: release_X.Y -> release_X -> main
-#   - push to release_2.1  => opens/keeps PR release_2.1 -> release_2
-#   - push to release_2    => opens/keeps PR release_2   -> main
+# When a PR merges into release_X / release_X.Y, this workflow cherry-picks
+# ONLY that PR's changes onto the parent branch and opens a dedicated PR:
 #
-# Branch name patterns (underscore style):
-#   release_<major>        e.g. release_2
-#   release_<major>.<minor> e.g. release_2.1 (hotfix branch)
+#   PR my-release-fix-1 -> release_2 (merged)
+#     => branch my-release-fix-1-to-main, PR my-release-fix-1-to-main -> main
+#
+#   PR my-hotfix -> release_2.1 (merged)
+#     => branch my-hotfix-to-release_2, PR -> release_2
+#     ... and when that merges, my-hotfix-to-main -> main (cascade)
+#
+# Each back-merge PR carries only the originating PR's changes and the
+# `back-merge` label (used by backmerge-guard).
+#
+# pull_request_target is used for a write-capable token (works for fork PRs
+# too). No PR code is executed — we only cherry-pick already-merged commits.
 
 name: Auto back-merge PR
 
 on:
-  push:
-    branches:
-      - 'release_*'
+  pull_request_target:
+    types: [closed]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
+  statuses: write
+
+concurrency:
+  group: auto-backmerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
 
 jobs:
-  create-backmerge-pr:
+  backmerge:
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.base.ref, 'release_')
     runs-on: ubuntu-latest
     steps:
-      - name: Determine parent branch
-        id: parent
+      - name: Compute parent branch and back-merge branch name
+        id: meta
         env:
-          BRANCH: ${{ github.ref_name }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
-          if [[ "$BRANCH" =~ ^release_([0-9]+)\.([0-9]+)$ ]]; then
+          if [[ "$BASE" =~ ^release_([0-9]+)\.([0-9]+)$ ]]; then
             PARENT="release_${BASH_REMATCH[1]}"
-          elif [[ "$BRANCH" =~ ^release_([0-9]+)$ ]]; then
+          elif [[ "$BASE" =~ ^release_([0-9]+)$ ]]; then
             PARENT="main"
           else
-            echo "Branch $BRANCH does not match release_X or release_X.Y — skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "Base $BASE is not release_X or release_X.Y — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "parent=$PARENT" >> "$GITHUB_OUTPUT"
+          NAME="$HEAD"
+          # cascade: strip the "-to-<base>" suffix so names don't accumulate
+          # (my-fix-to-release_2 merged into release_2 => my-fix-to-main)
+          [[ "$NAME" == *"-to-$BASE" ]] && NAME="${NAME%-to-$BASE}"
+          echo "skip=false"                >> "$GITHUB_OUTPUT"
+          echo "parent=$PARENT"            >> "$GITHUB_OUTPUT"
+          echo "new_branch=${NAME}-to-${PARENT}" >> "$GITHUB_OUTPUT"
 
       - name: Verify parent branch exists
-        if: steps.parent.outputs.skip == 'false'
+        if: steps.meta.outputs.skip == 'false'
         id: parent_exists
         env:
           GH_TOKEN: ${{ github.token }}
-          PARENT: ${{ steps.parent.outputs.parent }}
+          PARENT: ${{ steps.meta.outputs.parent }}
         run: |
           set -euo pipefail
           if gh api "repos/${{ github.repository }}/branches/$PARENT" --silent 2>/dev/null; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Parent branch $PARENT does not exist; skipping PR creation."
+            echo "::warning::Parent branch $PARENT does not exist; skipping."
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create or update back-merge PR
-        if: steps.parent.outputs.skip == 'false' && steps.parent_exists.outputs.exists == 'true'
+      - uses: actions/checkout@v4
+        if: steps.meta.outputs.skip == 'false' && steps.parent_exists.outputs.exists == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: Cherry-pick PR changes and open granular PR
+        if: steps.meta.outputs.skip == 'false' && steps.parent_exists.outputs.exists == 'true'
+        id: pick
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ github.ref_name }}
-          PARENT: ${{ steps.parent.outputs.parent }}
+          REPO: ${{ github.repository }}
+          PRNUM: ${{ github.event.pull_request.number }}
+          PRTITLE: ${{ github.event.pull_request.title }}
+          SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          NCOMMITS: ${{ github.event.pull_request.commits }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+          PARENT: ${{ steps.meta.outputs.parent }}
+          NEW: ${{ steps.meta.outputs.new_branch }}
         run: |
           set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Anything to merge?
-          AHEAD=$(gh api "repos/${{ github.repository }}/compare/$PARENT...$BRANCH" --jq '.ahead_by')
-          if [[ "$AHEAD" == "0" ]]; then
-            echo "$BRANCH has no commits ahead of $PARENT — nothing to back-merge."
+          git checkout -B "$NEW" "origin/$PARENT"
+
+          # Pick strategy depends on how the PR was merged:
+          #   merge commit  -> cherry-pick -m 1 <merge sha>
+          #   squash        -> cherry-pick <squash sha>
+          #   rebase        -> cherry-pick the N rebased commits
+          NPARENTS=$(( $(git rev-list --parents -n1 "$SHA" | wc -w) - 1 ))
+          if (( NPARENTS >= 2 )); then
+            PICK_DESC="merge commit $SHA (-m 1)"
+            PICK=(git cherry-pick -x -m 1 "$SHA")
+          elif (( NCOMMITS == 1 )) || git log -1 --format=%s "$SHA" | grep -q "(#$PRNUM)"; then
+            PICK_DESC="commit $SHA"
+            PICK=(git cherry-pick -x "$SHA")
+          else
+            PICK_DESC="range $SHA~$NCOMMITS..$SHA"
+            PICK=(git cherry-pick -x "$SHA~$NCOMMITS..$SHA")
+          fi
+          echo "Cherry-picking $PICK_DESC onto $PARENT"
+
+          if ! "${PICK[@]}"; then
+            git cherry-pick --abort || true
+            gh pr comment "$PRNUM" --repo "$REPO" --body \
+              ":warning: **Automatic back-merge to \`$PARENT\` failed** (cherry-pick conflict picking $PICK_DESC).<br>Please back-merge manually: \`git checkout -b $NEW origin/$PARENT && git cherry-pick ${NPARENTS:+-m 1 }$SHA\` and open a PR to \`$PARENT\` with the \`back-merge\` label."
+            echo "::error::Cherry-pick conflict — manual back-merge required for PR #$PRNUM -> $PARENT"
+            exit 1
+          fi
+
+          if git diff --quiet "origin/$PARENT"; then
+            echo "No effective changes vs $PARENT — nothing to back-merge."
+            echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Existing open PR for this back-merge?
-          EXISTING=$(gh pr list \
-            --repo "${{ github.repository }}" \
-            --head "$BRANCH" --base "$PARENT" \
-            --state open --json number --jq 'length')
-          if [[ "$EXISTING" != "0" ]]; then
-            echo "Open back-merge PR $BRANCH -> $PARENT already exists; new commits ride along."
-            exit 0
-          fi
+          git push -f origin "$NEW"
 
-          gh pr create \
-            --repo "${{ github.repository }}" \
-            --head "$BRANCH" --base "$PARENT" \
-            --title "Back-merge: $BRANCH -> $PARENT" \
-            --label back-merge \
-            --body "$(cat <<EOF
-          Automated back-merge PR.
+          # Reuse existing open PR for this branch if present
+          EXISTING=$(gh pr list --repo "$REPO" --head "$NEW" --base "$PARENT" --state open --json number --jq 'length')
+          if [[ "$EXISTING" == "0" ]]; then
+            gh pr create --repo "$REPO" \
+              --head "$NEW" --base "$PARENT" \
+              --title "Back-merge to $PARENT: $PRTITLE" \
+              --label back-merge \
+              --body "$(cat <<EOF
+          Automated granular back-merge of #$PRNUM (\`$HEAD\` -> \`$BASE\`) into \`$PARENT\`.
 
-          Changes pushed to \`$BRANCH\` must flow back to \`$PARENT\`.
-          Merging into \`$PARENT\` (and up the chain) is blocked by the
-          **backmerge-guard** check until this PR is merged.
+          Contains **only** the changes from #$PRNUM (cherry-picked: $PICK_DESC).
+          Merging other PRs into \`$PARENT\` is blocked by **backmerge-guard** until this is merged.
 
-          Triggered by commit: ${{ github.sha }}
+          <!-- backmerge source=$BASE target=$PARENT origin_pr=$PRNUM -->
           EOF
-          )" || {
-            # --label fails if label doesn't exist; retry without it
-            gh pr create \
-              --repo "${{ github.repository }}" \
-              --head "$BRANCH" --base "$PARENT" \
-              --title "Back-merge: $BRANCH -> $PARENT" \
-              --body "Automated back-merge PR from \`$BRANCH\` to \`$PARENT\`. Triggered by ${{ github.sha }}."
-          }
+          )"
+          fi
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+          # Back-merge PRs always pass the guard — post status immediately
+          # (PRs created with GITHUB_TOKEN don't trigger workflows themselves).
+          gh api "repos/$REPO/statuses/$(git rev-parse HEAD)" \
+            -f state=success -f context=backmerge-guard \
+            -f description="Back-merge PR — always allowed." >/dev/null
+
+      - name: Refresh guard statuses on all open PRs
+        if: >-
+          always() && steps.meta.outputs.skip == 'false' &&
+          steps.parent_exists.outputs.exists == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const guard = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/backmerge-guard.cjs`);
+            await guard({ github, context, core });

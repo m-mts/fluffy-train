@@ -1,27 +1,24 @@
 # backmerge-guard — blocks merging while back-merge PRs are unmerged.
 #
 # Posts a commit status (context: "backmerge-guard") on the head SHA of every
-# open PR targeting main / release_* branches. Make it a *required* status
-# check via branch ruleset (see .github/RELEASE_FLOW.md) and merges are
-# blocked while it is red.
+# open PR targeting main / release_*. Required via branch ruleset, so a red
+# status blocks the merge.
 #
-# A PR targeting branch B fails the guard when:
-#   1. an open back-merge PR INTO B exists (e.g. release_2.1 -> release_2
-#      open blocks everything else merging into release_2; release_2 -> main
-#      open blocks everything else merging into main), or
-#   2. B itself has an unmerged back-merge PR to its parent (e.g. new work
-#      into release_2.1 is blocked while release_2.1 -> release_2 is open).
+# A PR targeting branch B fails while any open back-merge PR into B exists
+# (back-merge PRs carry the `back-merge` label). Back-merge PRs themselves
+# always pass — they are the remedy.
 #
-# Auto back-merge PRs themselves always pass — they are the remedy.
+# Logic lives in .github/scripts/backmerge-guard.cjs (shared with the
+# auto-backmerge workflow).
 #
-# Uses pull_request_target: no PR code is checked out or executed, we only
-# call the GitHub API, so this is safe and works for fork PRs too.
+# pull_request_target: safe — no PR code is checked out or executed, only the
+# base branch's script; works for fork PRs too.
 
 name: backmerge-guard
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, closed]
+    types: [opened, reopened, synchronize, ready_for_review, closed, labeled, unlabeled]
   workflow_dispatch:
 
 permissions:
@@ -36,70 +33,11 @@ jobs:
   guard:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4   # checks out the base branch (trusted)
+
       - name: Evaluate all open PRs
         uses: actions/github-script@v7
         with:
           script: |
-            const CONTEXT = 'backmerge-guard';
-            const relRe    = /^release_(\d+)(?:\.(\d+))?$/;
-
-            const parentOf = (branch) => {
-              const m = branch.match(relRe);
-              if (!m) return null;
-              return m[2] !== undefined ? `release_${m[1]}` : 'main';
-            };
-            const childRe = (base) => {
-              if (base === 'main') return /^release_\d+$/;
-              const m = base.match(/^release_(\d+)$/);
-              if (m) return new RegExp(`^release_${m[1]}\\.\\d+$`);
-              return null; // release_X.Y has no children
-            };
-
-            const { owner, repo } = context.repo;
-            const prs = await github.paginate(github.rest.pulls.list, {
-              owner, repo, state: 'open', per_page: 100,
-            });
-
-            // Open back-merge PRs: head matches release_* and base is its parent
-            const backmerges = prs.filter(
-              (p) => relRe.test(p.head.ref) && p.base.ref === parentOf(p.head.ref)
-            );
-
-            for (const pr of prs) {
-              const base = pr.base.ref;
-              if (base !== 'main' && !relRe.test(base)) continue; // unguarded base
-
-              const isBackmerge =
-                relRe.test(pr.head.ref) && base === parentOf(pr.head.ref);
-
-              let state = 'success';
-              let description = 'No pending back-merges.';
-
-              if (!isBackmerge) {
-                const cre = childRe(base);
-                const into = cre
-                  ? backmerges.filter((b) => b.base.ref === base && cre.test(b.head.ref))
-                  : [];
-                const from = backmerges.filter((b) => b.head.ref === base);
-                const blockers = [...into, ...from].filter((b) => b.number !== pr.number);
-
-                if (blockers.length > 0) {
-                  state = 'failure';
-                  description = `Blocked by unmerged back-merge PR(s): ${blockers
-                    .map((b) => `#${b.number} (${b.head.ref} -> ${b.base.ref})`)
-                    .join(', ')}`.slice(0, 140);
-                }
-              } else {
-                description = 'Back-merge PR — always allowed.';
-              }
-
-              core.info(`PR #${pr.number} (${pr.head.ref} -> ${base}): ${state} — ${description}`);
-              await github.rest.repos.createCommitStatus({
-                owner, repo,
-                sha: pr.head.sha,
-                context: CONTEXT,
-                state,
-                description,
-                target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
-              });
-            }
+            const guard = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/backmerge-guard.cjs`);
+            await guard({ github, context, core });

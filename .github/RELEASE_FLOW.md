@@ -3,34 +3,49 @@
 Branch hierarchy and back-merge direction:
 
 ```
-release_2.1 (hotfix) ──PR──> release_2 ──PR──> main
+release_2.1 (hotfix) ──> release_2 ──> main
 ```
 
 Branch naming: `release_<major>` (e.g. `release_2`), `release_<major>.<minor>` for hotfixes (e.g. `release_2.1`).
 
+`main` and all `release_*` branches are protected: **changes land only via PR** (direct pushes rejected), and the **backmerge-guard** status check is required. Creating new `release_*` branches is still allowed.
+
 ## Automations
 
-### 1. `auto-backmerge-pr.yml`
+### 1. `auto-backmerge-pr.yml` — granular back-merge PRs
 
-On every push to a `release_*` branch, automatically opens a PR back to the parent branch (`release_X.Y → release_X`, `release_X → main`). If an open back-merge PR already exists, new commits ride along. Skips when there is nothing to merge or the parent branch doesn't exist. PRs get the `back-merge` label.
+When a PR merges into a `release_*` branch, the workflow cherry-picks **only that PR's changes** onto the parent branch (`release_X.Y → release_X`, `release_X → main`) in a new branch named `<original-branch>-to-<parent>`, and opens a dedicated PR labeled `back-merge`.
 
-### 2. `backmerge-guard.yml`
+Example — two fixes merged into `release_2`:
 
-Posts a commit status (context `backmerge-guard`) on every open PR targeting `main` or `release_*`. A PR targeting branch `B` **fails** the check when an open back-merge PR into `B` exists, or `B` itself has an unmerged back-merge PR to its parent. Auto back-merge PRs always pass — they are the remedy. Statuses refresh automatically when PRs open, update, or close; you can also trigger a refresh manually from the Actions tab (workflow_dispatch).
+```
+my-release-fix-1 ──PR──> release_2   =>  my-release-fix-1-to-main ──PR──> main
+my-release-fix-2 ──PR──> release_2   =>  my-release-fix-2-to-main ──PR──> main
+```
+
+Each PR to `main` contains only its own fix. Hotfixes cascade: a PR merged into `release_2.1` produces `<name>-to-release_2 → release_2`, and merging that produces `<name>-to-main → main` (the `-to-*` suffix doesn't accumulate).
+
+All merge methods are supported (merge commit, squash, rebase). On a cherry-pick conflict the workflow comments on the original PR with manual back-merge instructions and fails the run.
+
+### 2. `backmerge-guard.yml` + `scripts/backmerge-guard.cjs`
+
+Posts the required `backmerge-guard` status on every open PR targeting `main`/`release_*`:
+
+- PRs **labeled `back-merge`** always pass — they are the remedy.
+- Any other PR targeting branch `B` **fails while an open `back-merge` PR into `B` exists** — pending back-merges must land first.
+
+Statuses refresh on PR open/update/close/label events and after each auto back-merge; manual refresh via workflow_dispatch in the Actions tab.
+
+Note: merging more fixes into `release_2` is *not* blocked while its back-merges to `main` are open — by design, each fix produces its own granular PR to `main`.
 
 ### 3. Branch ruleset `backmerge-guard` (id 19781015, active)
 
-Targets `release_*` branches and requires the `backmerge-guard` status check (from GitHub Actions) before the branch can be updated.
+Targets `main` and `release_*`. Rules: pull request required (0 approvals — raise in Settings → Rules if you want reviews), `backmerge-guard` status check required (from GitHub Actions), branch creation exempt. Repo also has *delete branch on merge* enabled, so `*-to-*` helper branches clean themselves up.
 
-Consequences to be aware of:
+## Typical cycle
 
-- All changes to `release_*` branches must go through PRs — direct pushes are rejected, because a directly-pushed commit can never carry a passing `backmerge-guard` status. This is a GitHub limitation: push-time rules can't depend on external state, so PR-only flow is what makes the conditional blocking enforceable.
-- Creating a new `release_*` branch is still allowed (`do_not_enforce_on_create`).
-- `main` is intentionally **not** in the ruleset — the guard status still appears on PRs targeting `main`, but it isn't required there. To enforce it on `main` too, add `refs/heads/main` to the ruleset's included refs (Settings → Rules → Rulesets → backmerge-guard).
+1. Branch `my-release-fix-1` off `release_2`, open PR into `release_2`, merge when guard is green.
+2. Automation opens `my-release-fix-1-to-main → main` with just that fix. Other (non-back-merge) PRs into `main` are blocked until it merges.
+3. Merge it into `main`; guard goes green everywhere.
 
-## Typical hotfix cycle
-
-1. Branch a fix off `release_2.1`, open a PR into `release_2.1`, merge it (guard is green when `release_2.1` has no pending back-merge).
-2. The merge push triggers auto-creation of PR `release_2.1 → release_2`. While it's open, other PRs into `release_2` (and into `release_2.1`) are blocked.
-3. Merge the back-merge PR into `release_2`. That push triggers PR `release_2 → main`.
-4. Merge into `main`. Everything is green again.
+Same for hotfix branches, with one extra hop: `release_2.1 → release_2 → main`.
