@@ -1,4 +1,6 @@
-# Release branch flow
+# Release branch flow — reference
+
+Day-to-day usage and troubleshooting live in the [README](../README.md). This file is the design/config reference.
 
 Branch hierarchy and back-merge direction:
 
@@ -41,6 +43,52 @@ Note: merging more fixes into `release_2` is *not* blocked while its back-merges
 ### 3. Branch ruleset `backmerge-guard` (id 19781015, active)
 
 Targets `main` and `release_*`. Rules: pull request required (0 approvals — raise in Settings → Rules if you want reviews), `backmerge-guard` status check required (from GitHub Actions), branch creation exempt. Repo also has *delete branch on merge* enabled, so `*-to-*` helper branches clean themselves up.
+
+Exact configuration (`gh api repos/OWNER/REPO/rulesets --method POST --input ruleset.json`):
+
+```json
+{
+  "name": "backmerge-guard",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": { "include": ["refs/heads/main", "refs/heads/release_*"], "exclude": [] }
+  },
+  "rules": [
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": false,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": false,
+        "allowed_merge_methods": ["merge", "squash", "rebase"]
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": true,
+        "required_status_checks": [
+          { "context": "backmerge-guard", "integration_id": 15368 }
+        ]
+      }
+    }
+  ]
+}
+```
+
+`integration_id` 15368 is the GitHub Actions app — pinning it means an arbitrary token can't post a green `backmerge-guard` status. `do_not_enforce_on_create: true` keeps `git push origin main:release_3` working for new release branches.
+
+### Why `pull_request_target`
+
+Both workflows need a write-capable token and must run from trusted code. `pull_request_target` runs the **base branch's** workflow definition with a write token; neither workflow checks out or executes PR head code (auto-backmerge only cherry-picks already-merged commits; the guard only calls the API), so fork PRs are handled safely.
+
+### Why direct pushes to release branches are rejected
+
+A required status check can only be evaluated on a PR. GitHub's push rules can't depend on external state like "are there open back-merge PRs", so PR-only flow is what makes conditional blocking enforceable at all.
 
 ### 4. Is `release_X` good to release?
 
