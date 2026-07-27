@@ -1,0 +1,95 @@
+# Sample release workflow.
+#
+# Gate: a release_X or release_X.Y branch can only be released once all of its
+# changes have flowed back up to main (and, for hotfix branches, through
+# release_X on the way). If anything is unmerged or a back-merge PR is still
+# open, this workflow FAILS before any release step runs.
+#
+# Trigger: manually from the Actions tab with the release branch selected, or
+# by pushing a tag like v2.0.0 / v2.1.0 (tag must point at a release branch commit).
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version/tag to release (e.g. v2.1.0)'
+        required: false
+        type: string
+      allow_unmerged:
+        description: 'Emergency override — release even if back-merges are pending'
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify-backmerged:
+    name: Verify back-merges complete
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.branch.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release branch
+        id: branch
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*'
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            # pick the release_* branch containing this tag (most specific first)
+            NAME=$(git branch -r --contains "${{ github.sha }}" \
+                   | sed 's#^ *origin/##' | grep -E '^release_[0-9]+(\.[0-9]+)?$' \
+                   | sort -Vr | head -1 || true)
+            [[ -z "$NAME" ]] && { echo "::error::Tag ${{ github.ref_name }} is not on a release_* branch."; exit 1; }
+          else
+            NAME="${{ github.ref_name }}"
+            if [[ ! "$NAME" =~ ^release_[0-9]+(\.[0-9]+)?$ ]]; then
+              echo "::error::Run this workflow from a release_X or release_X.Y branch (got '$NAME')."
+              exit 1
+            fi
+          fi
+          echo "Release branch: $NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Release readiness gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          OVERRIDE: ${{ inputs.allow_unmerged }}
+        run: |
+          chmod +x .github/scripts/release-readiness.sh
+          if .github/scripts/release-readiness.sh "$BRANCH"; then
+            echo "::notice::$BRANCH is fully back-merged — proceeding with release."
+          else
+            if [[ "$OVERRIDE" == "true" ]]; then
+              echo "::warning::$BRANCH has pending back-merges — continuing due to allow_unmerged override."
+            else
+              echo "::error::$BRANCH is NOT ready to release: changes are missing from its parent branch(es) or back-merge PRs are still open. See the job summary."
+              exit 1
+            fi
+          fi
+
+  release:
+    name: Release ${{ needs.verify-backmerged.outputs.branch }}
+    needs: verify-backmerged
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- replace with real release steps (build, publish, tag, notify) ----
+      - name: Build and publish (placeholder)
+        run: |
+          echo "Releasing ${{ needs.verify-backmerged.outputs.branch }} ${{ inputs.version || github.ref_name }}"
+          echo "All back-merges verified complete."
