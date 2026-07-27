@@ -1,0 +1,44 @@
+# Release readiness report — "is release_X good to release?"
+#
+# Run manually (Actions -> Release readiness -> Run workflow, optionally naming
+# a branch) or let the daily schedule report on every release_* branch.
+# The result is written to the run's job summary; the run fails if any checked
+# branch still has unmerged work.
+
+name: Release readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Release branch to check (blank = all release_* branches)'
+        required: false
+        type: string
+  schedule:
+    - cron: '0 7 * * 1-5'   # weekdays 07:00 UTC
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check release readiness
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          git fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*'
+          chmod +x .github/scripts/release-readiness.sh
+          if [[ -n "$BRANCH" ]]; then
+            .github/scripts/release-readiness.sh "$BRANCH"
+          else
+            .github/scripts/release-readiness.sh --all
+          fi
